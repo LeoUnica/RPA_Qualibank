@@ -13,6 +13,12 @@ MODO DE TESTE (DRY_RUN=True, padrao): a decisao de aprovar e SO REGISTRADA
 em log/planilha (resultado_simulacao.xlsx). O robo NAO clica em "Acoes"
 nem em "Aprovacao Supervisor" e NAO aprova nenhuma proposta de verdade.
 
+A coluna "Data e Horario da Aprovacao do Supervisor" do relatorio NAO vem
+do sistema (nenhuma proposta foi aprovada de verdade) - e o horario em
+que o robo simulou a decisao de aprovar, preenchido so quando DRY_RUN
+decide "Aprovado". A "Data e Horario da Proposta" vem da secao real
+"Log do Registro" -> "Data de Cadastro" de cada proposta.
+
 A funcao aprovar_proposta_real() faz o clique de aprovacao real (Acoes ->
 Aprovacao Supervisor -> observacao "Aprovado via RPA"), mas foi escrita
 apenas a partir da especificacao recebida - NUNCA foi executada nem
@@ -23,6 +29,7 @@ preferencia em ambiente de homologacao).
 """
 
 import os
+from datetime import datetime
 from urllib.parse import urlparse
 
 from openpyxl import Workbook
@@ -56,9 +63,9 @@ def _cartao_da_secao(page, titulo):
 
 def _campo(cartao, rotulo):
     campo = cartao.locator(
-        f'xpath=.//div[contains(@class,"ajin-label")]'
+        f'xpath=.//*[contains(@class,"ajin-label")]'
         f'[normalize-space(text())="{rotulo}"]'
-        f'/following-sibling::div[contains(@class,"ajin-value")][1]'
+        f'/following-sibling::*[contains(@class,"ajin-value")][1]'
     )
     return campo.inner_text().strip()
 
@@ -72,7 +79,10 @@ def ler_proposta(page):
     cartao_pessoais = _cartao_da_secao(page, "Dados Pessoais")
     nome = _campo(cartao_pessoais, "Name")
 
-    return contrato, nome, valor, liquido
+    cartao_log = _cartao_da_secao(page, "Log do Registro")
+    data_proposta = _campo(cartao_log, "Data de Cadastro:")
+
+    return contrato, nome, valor, liquido, data_proposta
 
 
 def aprovar_proposta_real(page):
@@ -108,11 +118,19 @@ def processar_propostas(page):
         page.wait_for_timeout(1000)
 
         try:
-            contrato, nome, valor, liquido = ler_proposta(page)
+            contrato, nome, valor, liquido, data_proposta = ler_proposta(page)
         except Exception as e:
             print(f"[{i}] Nao foi possivel ler a proposta: {e}")
             resultados.append(
-                {"contrato": "?", "nome": "", "valor": None, "liquido": None, "aprovado": False}
+                {
+                    "contrato": "?",
+                    "nome": "",
+                    "valor": None,
+                    "liquido": None,
+                    "data_proposta": "",
+                    "data_aprovacao_supervisor": "",
+                    "aprovado": False,
+                }
             )
             continue
 
@@ -120,14 +138,27 @@ def processar_propostas(page):
         decisao = "APROVARIA" if aprovado else "PULA (valor > limite)"
         print(f"[{i}] Contrato {contrato} - Valor do Contrato: R$ {valor:,.2f} -> {decisao}")
 
+        data_aprovacao_supervisor = ""
         if aprovado:
+            # Nao existe aprovacao real do supervisor (DRY_RUN sempre ativo aqui).
+            # Este horario e o momento em que O ROBO SIMULOU a aprovacao, nao uma
+            # aprovacao de verdade registrada no sistema.
+            data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
             if DRY_RUN:
                 print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
             else:
                 aprovar_proposta_real(page)
 
         resultados.append(
-            {"contrato": contrato, "nome": nome, "valor": valor, "liquido": liquido, "aprovado": aprovado}
+            {
+                "contrato": contrato,
+                "nome": nome,
+                "valor": valor,
+                "liquido": liquido,
+                "data_proposta": data_proposta,
+                "data_aprovacao_supervisor": data_aprovacao_supervisor,
+                "aprovado": aprovado,
+            }
         )
 
     return resultados
@@ -151,6 +182,8 @@ def gerar_relatorio(resultados, caminho):
         ("Nome da Pessoa", 34),
         ("Valor Contrato", 18),
         ("Valor Líquido", 18),
+        ("Data e Horário da Proposta", 24),
+        ("Data e Horário da Aprovação do Supervisor", 30),
         ("Decisão", 22),
     ]
 
@@ -172,6 +205,8 @@ def gerar_relatorio(resultados, caminho):
             item.get("nome") or "-",
             item.get("valor"),
             item.get("liquido"),
+            item.get("data_proposta") or "-",
+            item.get("data_aprovacao_supervisor") or "",
             decisao_texto,
         ]
         for col_idx, valor in enumerate(valores, start=1):
@@ -179,7 +214,7 @@ def gerar_relatorio(resultados, caminho):
             celula.border = THIN_BORDER
             if col_idx in (3, 4) and isinstance(valor, (int, float)):
                 celula.number_format = MOEDA_FORMATO
-            if col_idx == 5:
+            if col_idx in (5, 6, 7):
                 celula.alignment = Alignment(horizontal="center")
             if aprovado:
                 celula.fill = APROVADO_FILL
