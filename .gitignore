@@ -5,3 +5,5 @@ __pycache__/
 screenshots/
 *.log
 resultado_simulacao.csv
+resultado_simulacao.xlsx
+~$*.xlsx

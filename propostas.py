@@ -10,8 +10,8 @@ Fluxo:
       - valor >  R$ 10.000,00  -> pula para a proxima
 
 MODO DE TESTE (DRY_RUN=True, padrao): a decisao de aprovar e SO REGISTRADA
-em log/CSV. O robo NAO clica em "Acoes" nem em "Aprovacao Supervisor" e
-NAO aprova nenhuma proposta de verdade.
+em log/planilha (resultado_simulacao.xlsx). O robo NAO clica em "Acoes"
+nem em "Aprovacao Supervisor" e NAO aprova nenhuma proposta de verdade.
 
 A funcao aprovar_proposta_real() faz o clique de aprovacao real (Acoes ->
 Aprovacao Supervisor -> observacao "Aprovado via RPA"), mas foi escrita
@@ -22,10 +22,12 @@ Antes de rodar com DRY_RUN=False, valide esse fluxo manualmente (de
 preferencia em ambiente de homologacao).
 """
 
-import csv
 import os
 from urllib.parse import urlparse
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from playwright.sync_api import sync_playwright
 
 from login import login, URL as LOGIN_URL
@@ -62,10 +64,15 @@ def _campo(cartao, rotulo):
 
 
 def ler_proposta(page):
-    cartao = _cartao_da_secao(page, "Proposta")
-    contrato = _campo(cartao, "Contrato")
-    valor = parse_valor_brl(_campo(cartao, "Valor do Contrato"))
-    return contrato, valor
+    cartao_proposta = _cartao_da_secao(page, "Proposta")
+    contrato = _campo(cartao_proposta, "Contrato")
+    valor = parse_valor_brl(_campo(cartao_proposta, "Valor do Contrato"))
+    liquido = parse_valor_brl(_campo(cartao_proposta, "Líquido"))
+
+    cartao_pessoais = _cartao_da_secao(page, "Dados Pessoais")
+    nome = _campo(cartao_pessoais, "Name")
+
+    return contrato, nome, valor, liquido
 
 
 def aprovar_proposta_real(page):
@@ -101,24 +108,84 @@ def processar_propostas(page):
         page.wait_for_timeout(1000)
 
         try:
-            contrato, valor = ler_proposta(page)
+            contrato, nome, valor, liquido = ler_proposta(page)
         except Exception as e:
             print(f"[{i}] Nao foi possivel ler a proposta: {e}")
-            resultados.append({"contrato": "?", "valor": "", "decisao": f"ERRO: {e}"})
+            resultados.append(
+                {"contrato": "?", "nome": "", "valor": None, "liquido": None, "aprovado": False}
+            )
             continue
 
-        decisao = "APROVARIA" if valor <= VALOR_LIMITE else "PULA (valor > limite)"
+        aprovado = valor <= VALOR_LIMITE
+        decisao = "APROVARIA" if aprovado else "PULA (valor > limite)"
         print(f"[{i}] Contrato {contrato} - Valor do Contrato: R$ {valor:,.2f} -> {decisao}")
 
-        if decisao == "APROVARIA":
+        if aprovado:
             if DRY_RUN:
                 print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
             else:
                 aprovar_proposta_real(page)
 
-        resultados.append({"contrato": contrato, "valor": valor, "decisao": decisao})
+        resultados.append(
+            {"contrato": contrato, "nome": nome, "valor": valor, "liquido": liquido, "aprovado": aprovado}
+        )
 
     return resultados
+
+
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+APROVADO_FILL = PatternFill("solid", fgColor="C6EFCE")
+APROVADO_FONT = Font(color="006100")
+THIN_BORDER = Border(*(Side(style="thin", color="D9D9D9"),) * 4)
+MOEDA_FORMATO = '"R$" #,##0.00'
+
+
+def gerar_relatorio(resultados, caminho):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Simulacao de Propostas"
+
+    colunas = [
+        ("Código do Contrato", 22),
+        ("Nome da Pessoa", 34),
+        ("Valor Contrato", 18),
+        ("Valor Líquido", 18),
+        ("Decisão", 22),
+    ]
+
+    for col_idx, (titulo, largura) in enumerate(colunas, start=1):
+        celula = ws.cell(row=1, column=col_idx, value=titulo)
+        celula.fill = HEADER_FILL
+        celula.font = HEADER_FONT
+        celula.alignment = Alignment(horizontal="center", vertical="center")
+        celula.border = THIN_BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = largura
+    ws.freeze_panes = "A2"
+
+    for row_idx, item in enumerate(resultados, start=2):
+        aprovado = item.get("aprovado", False)
+        decisao_texto = "Aprovado" if aprovado else "Não Aprovado"
+
+        valores = [
+            item.get("contrato") or "-",
+            item.get("nome") or "-",
+            item.get("valor"),
+            item.get("liquido"),
+            decisao_texto,
+        ]
+        for col_idx, valor in enumerate(valores, start=1):
+            celula = ws.cell(row=row_idx, column=col_idx, value=valor)
+            celula.border = THIN_BORDER
+            if col_idx in (3, 4) and isinstance(valor, (int, float)):
+                celula.number_format = MOEDA_FORMATO
+            if col_idx == 5:
+                celula.alignment = Alignment(horizontal="center")
+            if aprovado:
+                celula.fill = APROVADO_FILL
+                celula.font = APROVADO_FONT
+
+    wb.save(caminho)
 
 
 if __name__ == "__main__":
@@ -127,10 +194,8 @@ if __name__ == "__main__":
         browser, page = login(p)
         resultados = processar_propostas(page)
 
-        with open("resultado_simulacao.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["contrato", "valor", "decisao"])
-            writer.writeheader()
-            writer.writerows(resultados)
+        caminho_relatorio = "resultado_simulacao.xlsx"
+        gerar_relatorio(resultados, caminho_relatorio)
 
-        print(f"\nResultado salvo em resultado_simulacao.csv ({len(resultados)} propostas).")
+        print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
         browser.close()
