@@ -1,0 +1,76 @@
+"""
+RPA - QualiBank: login no portal.
+
+Passo 1 do fluxo de simulacao de liberacao de propostas.
+Este script SOMENTE realiza o login. Nenhuma acao de aprovacao/liberacao
+de proposta deve ser adicionada aqui - isso fica para uma etapa separada,
+com trava explicita para nao aprovar nada durante os testes.
+"""
+
+import os
+import sys
+
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
+
+load_dotenv()
+
+URL = os.environ["QUALI_URL"]
+ACCESS_ID = os.environ["QUALI_ACCESS_ID"]
+PASSWORD = os.environ["QUALI_PASSWORD"]
+
+
+def login(playwright):
+    browser = playwright.chromium.launch(headless=False)
+    page = browser.new_page()
+
+    page.goto(URL)
+
+    page.click("#accessId")
+    page.fill("#accessId", ACCESS_ID)
+
+    page.click("#password")
+    page.fill("#password", PASSWORD)
+
+    page.get_by_text("Login", exact=True).click()
+
+    page.wait_for_load_state("networkidle")
+    print(f"URL apos login: {page.url}")
+
+    close_notificacao(page)
+
+    page.screenshot(path="screenshots/apos_login.png")
+
+    return browser, page
+
+
+def close_notificacao(page, timeout=8000):
+    """Le e fecha o popup de 'notification-reader' (avisos da Quali), se aparecer.
+
+    Rola o corpo do aviso ate o fim (isso habilita o botao de confirmacao,
+    ex.: "Confirmo que li" / "Declaro que li tudo") e clica nele. E so uma
+    confirmacao de leitura de aviso - nao tem relacao com aprovacao/liberacao
+    de proposta.
+    """
+    dialog = page.locator("notification-reader")
+    try:
+        dialog.wait_for(state="visible", timeout=timeout)
+    except Exception:
+        return False
+
+    corpo = dialog.locator("div.overflow-y-auto").first
+    corpo.evaluate("el => el.scrollTop = el.scrollHeight")
+    page.wait_for_timeout(300)
+
+    botao_confirmar = dialog.locator('button[mat-flat-button][color="primary"]')
+    botao_confirmar.click(timeout=timeout)
+    dialog.wait_for(state="hidden", timeout=timeout)
+    return True
+
+
+if __name__ == "__main__":
+    os.makedirs("screenshots", exist_ok=True)
+    with sync_playwright() as p:
+        browser, page = login(p)
+        input("Login realizado. Pressione Enter para fechar o navegador...")
+        browser.close()

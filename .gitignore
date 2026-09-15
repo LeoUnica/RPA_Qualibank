@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+screenshots/
+*.log
+resultado_simulacao.csv
