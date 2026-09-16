@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -14,7 +15,8 @@ LOANS_URL = f"{_origin.scheme}://{_origin.netloc}/loans"
 
 DRY_RUN = True
 VALOR_LIMITE = 10_000.00
-MAX_PROPOSTAS = 5  # quantas propostas da lista processar nesta simulacao
+MAX_PROPOSTAS = 10  # None = extrai todas as propostas da lista
+ITENS_POR_PAGINA = 50
 
 
 def parse_valor_brl(texto):
@@ -55,12 +57,63 @@ def ler_proposta(page):
     return contrato, nome, valor, liquido, data_proposta
 
 
+def ler_data_aprovacao_promotora(linha):
+    """Le a data/hora do status 'Aguardando Aprovação Promotora' direto na linha da lista."""
+    nota = linha.locator('ajin-status-label[name="operationStatus"] .ajin-note').first
+    if nota.count() == 0:
+        return ""
+    return nota.inner_text().strip()
+
+
 def aprovar_proposta_real(page):
     """NAO TESTADO. So deve ser chamado com DRY_RUN=False, apos validacao manual."""
     page.click('button:has-text("Ações")')
     page.get_by_text("Aprovação Supervisor", exact=True).click()
     page.fill("textarea[name='note']", "Aprovado via RPA")
     # TODO: mapear o botao final de confirmar/enviar - etapa nunca executada.
+
+
+def _total_propostas(page):
+    texto = page.locator("ajin-search-count").inner_text()
+    numeros = re.findall(r"\d+", texto)
+    return int(numeros[-1]) if numeros else 0
+
+
+def _ir_proxima_pagina(page):
+    botao = page.locator(
+        'ajin-search-pagination button:has(mat-icon[data-mat-icon-name="arrow_forward_ios"])'
+    )
+    botao.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(800)
+
+
+MAX_TENTATIVAS = 5
+ESPERA_ENTRE_TENTATIVAS_SEGUNDOS = 120
+
+
+def _abrir_e_ler_proposta(page, i):
+    pagina = i // ITENS_POR_PAGINA
+    posicao = i % ITENS_POR_PAGINA
+
+    page.goto(LOANS_URL)
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(800)
+
+    for _ in range(pagina):
+        _ir_proxima_pagina(page)
+
+    linha = page.locator("table.app-table-search tbody tr.cursor-pointer").nth(posicao)
+    data_aprovacao_promotora = ler_data_aprovacao_promotora(linha)
+
+    linha.locator('button[aria-haspopup="menu"]').first.click()
+    page.wait_for_timeout(400)
+    page.get_by_role("menuitem", name="Visualizar", exact=True).click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+
+    contrato, nome, valor, liquido, data_proposta = ler_proposta(page)
+    return contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora
 
 
 def processar_propostas(page):
@@ -70,27 +123,30 @@ def processar_propostas(page):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
 
-    linhas = page.locator("table.app-table-search tbody tr.cursor-pointer")
-    total = linhas.count()
-    n = min(total, MAX_PROPOSTAS)
+    total = _total_propostas(page)
+    n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
     print(f"Processando {n} de {total} propostas listadas (DRY_RUN={DRY_RUN})...")
 
     for i in range(n):
-        page.goto(LOANS_URL)
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
+        erro = None
+        dados = None
+        for tentativa in range(1, MAX_TENTATIVAS + 1):
+            try:
+                dados = _abrir_e_ler_proposta(page, i)
+                erro = None
+                break
+            except Exception as e:
+                erro = e
+                print(f"[{i}] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou: {e}")
+                if tentativa < MAX_TENTATIVAS:
+                    print(
+                        f"    Aguardando {ESPERA_ENTRE_TENTATIVAS_SEGUNDOS}s antes de "
+                        "tentar novamente (mesma sessao, sem novo login)..."
+                    )
+                    page.wait_for_timeout(ESPERA_ENTRE_TENTATIVAS_SEGUNDOS * 1000)
 
-        linha = page.locator("table.app-table-search tbody tr.cursor-pointer").nth(i)
-        linha.locator('button[aria-haspopup="menu"]').first.click()
-        page.wait_for_timeout(400)
-        page.get_by_role("menuitem", name="Visualizar", exact=True).click()
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1000)
-
-        try:
-            contrato, nome, valor, liquido, data_proposta = ler_proposta(page)
-        except Exception as e:
-            print(f"[{i}] Nao foi possivel ler a proposta: {e}")
+        if erro is not None:
+            print(f"[{i}] Desistindo apos {MAX_TENTATIVAS} tentativas: {erro}")
             resultados.append(
                 {
                     "contrato": "?",
@@ -98,11 +154,14 @@ def processar_propostas(page):
                     "valor": None,
                     "liquido": None,
                     "data_proposta": "",
+                    "data_aprovacao_promotora": "",
                     "data_aprovacao_supervisor": "",
                     "aprovado": False,
                 }
             )
             continue
+
+        contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora = dados
 
         aprovado = liquido <= VALOR_LIMITE
         decisao = "APROVARIA" if aprovado else "PULA (valor > limite)"
@@ -124,6 +183,7 @@ def processar_propostas(page):
                 "valor": valor,
                 "liquido": liquido,
                 "data_proposta": data_proposta,
+                "data_aprovacao_promotora": data_aprovacao_promotora,
                 "data_aprovacao_supervisor": data_aprovacao_supervisor,
                 "aprovado": aprovado,
             }
@@ -146,6 +206,7 @@ COLUNAS_RELATORIO = [
     ("Nome da Pessoa", 34),
     ("Valor Líquido", 18),
     ("Data e Horário da Proposta", 24),
+    ("Data e Horário Aguardando Aprovação Promotora", 32),
     ("Data e Horário da Aprovação do Supervisor", 30),
     ("Decisão", 22),
 ]
@@ -190,6 +251,7 @@ def _escrever_linha(ws, row_idx, item):
         item.get("nome") or "-",
         item.get("liquido"),
         item.get("data_proposta") or "-",
+        item.get("data_aprovacao_promotora") or "",
         item.get("data_aprovacao_supervisor") or "",
         decisao_texto,
     ]
@@ -198,7 +260,7 @@ def _escrever_linha(ws, row_idx, item):
         celula.border = THIN_BORDER
         if col_idx == 3 and isinstance(valor, (int, float)):
             celula.number_format = MOEDA_FORMATO
-        if col_idx in (4, 5, 6):
+        if col_idx in (4, 5, 6, 7):
             celula.alignment = Alignment(horizontal="center")
         celula.fill = APROVADO_FILL if aprovado else SEM_FILL
         celula.font = APROVADO_FONT if aprovado else FONTE_PADRAO
