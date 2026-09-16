@@ -104,9 +104,9 @@ def processar_propostas(page):
             )
             continue
 
-        aprovado = valor <= VALOR_LIMITE
+        aprovado = liquido <= VALOR_LIMITE
         decisao = "APROVARIA" if aprovado else "PULA (valor > limite)"
-        print(f"[{i}] Contrato {contrato} - Valor do Contrato: R$ {valor:,.2f} -> {decisao}")
+        print(f"[{i}] Contrato {contrato} - Valor Líquido: R$ {liquido:,.2f} -> {decisao}")
 
         data_aprovacao_supervisor = ""
         if aprovado:
