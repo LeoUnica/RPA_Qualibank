@@ -1,11 +1,3 @@
-"""
-RPA - QualiBank: login no portal.
-
-Passo 1 do fluxo de simulacao de liberacao de propostas.
-Este script SOMENTE realiza o login. Nenhuma acao de aprovacao/liberacao
-de proposta deve ser adicionada aqui - isso fica para uma etapa separada,
-com trava explicita para nao aprovar nada durante os testes.
-"""
 
 import os
 import sys
@@ -45,13 +37,6 @@ def login(playwright):
 
 
 def close_notificacao(page, timeout=8000):
-    """Le e fecha o popup de 'notification-reader' (avisos da Quali), se aparecer.
-
-    Rola o corpo do aviso ate o fim (isso habilita o botao de confirmacao,
-    ex.: "Confirmo que li" / "Declaro que li tudo") e clica nele. E so uma
-    confirmacao de leitura de aviso - nao tem relacao com aprovacao/liberacao
-    de proposta.
-    """
     dialog = page.locator("notification-reader")
     try:
         dialog.wait_for(state="visible", timeout=timeout)

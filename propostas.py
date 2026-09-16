@@ -1,33 +1,3 @@
-"""
-RPA - QualiBank: simulacao de liberacao de propostas.
-
-Fluxo:
- 1. Login (login.py) - ja fecha o popup de notificacao ao entrar.
- 2. Abre a lista de emprestimos (/loans).
- 3. Para cada proposta da lista: abre o menu de tres pontos, clica em
-    "Visualizar", le o "Valor do Contrato" na secao "Proposta" e decide:
-      - valor <= R$ 10.000,00  -> aprovaria
-      - valor >  R$ 10.000,00  -> pula para a proxima
-
-MODO DE TESTE (DRY_RUN=True, padrao): a decisao de aprovar e SO REGISTRADA
-em log/planilha (resultado_simulacao.xlsx). O robo NAO clica em "Acoes"
-nem em "Aprovacao Supervisor" e NAO aprova nenhuma proposta de verdade.
-
-A coluna "Data e Horario da Aprovacao do Supervisor" do relatorio NAO vem
-do sistema (nenhuma proposta foi aprovada de verdade) - e o horario em
-que o robo simulou a decisao de aprovar, preenchido so quando DRY_RUN
-decide "Aprovado". A "Data e Horario da Proposta" vem da secao real
-"Log do Registro" -> "Data de Cadastro" de cada proposta.
-
-A funcao aprovar_proposta_real() faz o clique de aprovacao real (Acoes ->
-Aprovacao Supervisor -> observacao "Aprovado via RPA"), mas foi escrita
-apenas a partir da especificacao recebida - NUNCA foi executada nem
-testada contra o site, porque isso aprovaria uma proposta real em
-producao. Falta inclusive mapear o botao final de confirmar/enviar.
-Antes de rodar com DRY_RUN=False, valide esse fluxo manualmente (de
-preferencia em ambiente de homologacao).
-"""
-
 import os
 from datetime import datetime
 from urllib.parse import urlparse
@@ -140,9 +110,7 @@ def processar_propostas(page):
 
         data_aprovacao_supervisor = ""
         if aprovado:
-            # Nao existe aprovacao real do supervisor (DRY_RUN sempre ativo aqui).
-            # Este horario e o momento em que O ROBO SIMULOU a aprovacao, nao uma
-            # aprovacao de verdade registrada no sistema.
+
             data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
             if DRY_RUN:
                 print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
@@ -237,12 +205,7 @@ def _escrever_linha(ws, row_idx, item):
 
 
 def gerar_relatorio(resultados, caminho):
-    """Gera/atualiza o relatorio com uma aba por ano (ano da Data de Cadastro).
 
-    Se o arquivo ja existir, ele e carregado e atualizado (nao sobrescreve
-    anos/propostas ja registrados). Uma proposta ja presente na aba do seu
-    ano (mesmo Codigo do Contrato) tem a linha atualizada em vez de duplicada.
-    """
     if os.path.exists(caminho):
         wb = load_workbook(caminho)
     else:
