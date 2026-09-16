@@ -13,6 +13,9 @@ from login import login, URL as LOGIN_URL
 _origin = urlparse(LOGIN_URL)
 LOANS_URL = f"{_origin.scheme}://{_origin.netloc}/loans"
 
+PASTA_PROJETO = os.path.dirname(os.path.abspath(__file__))
+CAMINHO_RELATORIO = os.path.join(PASTA_PROJETO, "resultado_simulacao.xlsx")
+
 DRY_RUN = True
 VALOR_LIMITE = 10_000.00
 MAX_PROPOSTAS = 10  # None = extrai todas as propostas da lista
@@ -73,10 +76,30 @@ def aprovar_proposta_real(page):
     # TODO: mapear o botao final de confirmar/enviar - etapa nunca executada.
 
 
+def _limpar_busca(page):
+    """Garante que a lista nao fique presa a um filtro de busca residual
+    (ex.: ficou preenchida com o nome do ultimo cliente visualizado)."""
+    campo_busca = page.locator('input[placeholder="Pesquisar"]')
+    if campo_busca.count() == 0:
+        return
+    if campo_busca.input_value():
+        campo_busca.fill("")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(500)
+
+
 def _total_propostas(page):
+    page.locator("table.app-table-search tbody tr.cursor-pointer").first.wait_for(
+        state="visible", timeout=30000
+    )
     texto = page.locator("ajin-search-count").inner_text()
     numeros = re.findall(r"\d+", texto)
-    return int(numeros[-1]) if numeros else 0
+    total = int(numeros[-1]) if numeros else 0
+
+    # Salvaguarda: a contagem do cabecalho pode nao ter carregado ainda;
+    # nunca reportar menos do que ja esta renderizado na pagina atual.
+    linhas_na_pagina = page.locator("table.app-table-search tbody tr.cursor-pointer").count()
+    return max(total, linhas_na_pagina)
 
 
 def _ir_proxima_pagina(page):
@@ -99,6 +122,7 @@ def _abrir_e_ler_proposta(page, i):
     page.goto(LOANS_URL)
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(800)
+    _limpar_busca(page)
 
     for _ in range(pagina):
         _ir_proxima_pagina(page)
@@ -122,6 +146,7 @@ def processar_propostas(page):
     page.goto(LOANS_URL)
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
+    _limpar_busca(page)
 
     total = _total_propostas(page)
     n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
@@ -294,13 +319,12 @@ def gerar_relatorio(resultados, caminho):
 
 
 if __name__ == "__main__":
-    os.makedirs("screenshots", exist_ok=True)
+    os.makedirs(os.path.join(PASTA_PROJETO, "screenshots"), exist_ok=True)
     with sync_playwright() as p:
         browser, page = login(p)
         resultados = processar_propostas(page)
 
-        caminho_relatorio = "resultado_simulacao.xlsx"
-        gerar_relatorio(resultados, caminho_relatorio)
+        gerar_relatorio(resultados, CAMINHO_RELATORIO)
 
-        print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
+        print(f"\nRelatorio salvo em {CAMINHO_RELATORIO} ({len(resultados)} propostas).")
         browser.close()
