@@ -32,7 +32,7 @@ import os
 from datetime import datetime
 from urllib.parse import urlparse
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from playwright.sync_api import sync_playwright
@@ -168,26 +168,41 @@ HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
 APROVADO_FILL = PatternFill("solid", fgColor="C6EFCE")
 APROVADO_FONT = Font(color="006100")
+SEM_FILL = PatternFill(fill_type=None)
+FONTE_PADRAO = Font(color="000000")
 THIN_BORDER = Border(*(Side(style="thin", color="D9D9D9"),) * 4)
 MOEDA_FORMATO = '"R$" #,##0.00'
 
+COLUNAS_RELATORIO = [
+    ("Código do Contrato", 22),
+    ("Nome da Pessoa", 34),
+    ("Valor Líquido", 18),
+    ("Data e Horário da Proposta", 24),
+    ("Data e Horário da Aprovação do Supervisor", 30),
+    ("Decisão", 22),
+]
 
-def gerar_relatorio(resultados, caminho):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Simulacao de Propostas"
 
-    colunas = [
-        ("Código do Contrato", 22),
-        ("Nome da Pessoa", 34),
-        ("Valor Contrato", 18),
-        ("Valor Líquido", 18),
-        ("Data e Horário da Proposta", 24),
-        ("Data e Horário da Aprovação do Supervisor", 30),
-        ("Decisão", 22),
-    ]
+def _ano_da_proposta(item):
+    """Ano usado para escolher a aba: ano da 'Data de Cadastro' real da proposta."""
+    try:
+        return datetime.strptime(item.get("data_proposta", ""), "%d/%m/%Y %H:%M").year
+    except (TypeError, ValueError):
+        return datetime.now().year
 
-    for col_idx, (titulo, largura) in enumerate(colunas, start=1):
+
+def _obter_ou_criar_aba(wb, nome_aba):
+    if nome_aba in wb.sheetnames:
+        return wb[nome_aba]
+
+    # Reaproveita a aba padrao "Sheet" vazia da primeira criacao do workbook.
+    if wb.sheetnames == ["Sheet"] and wb["Sheet"].max_row == 1 and wb["Sheet"]["A1"].value is None:
+        ws = wb["Sheet"]
+        ws.title = nome_aba
+    else:
+        ws = wb.create_sheet(nome_aba)
+
+    for col_idx, (titulo, largura) in enumerate(COLUNAS_RELATORIO, start=1):
         celula = ws.cell(row=1, column=col_idx, value=titulo)
         celula.fill = HEADER_FILL
         celula.font = HEADER_FONT
@@ -195,31 +210,61 @@ def gerar_relatorio(resultados, caminho):
         celula.border = THIN_BORDER
         ws.column_dimensions[get_column_letter(col_idx)].width = largura
     ws.freeze_panes = "A2"
+    return ws
 
-    for row_idx, item in enumerate(resultados, start=2):
-        aprovado = item.get("aprovado", False)
-        decisao_texto = "Aprovado" if aprovado else "Não Aprovado"
 
-        valores = [
-            item.get("contrato") or "-",
-            item.get("nome") or "-",
-            item.get("valor"),
-            item.get("liquido"),
-            item.get("data_proposta") or "-",
-            item.get("data_aprovacao_supervisor") or "",
-            decisao_texto,
-        ]
-        for col_idx, valor in enumerate(valores, start=1):
-            celula = ws.cell(row=row_idx, column=col_idx, value=valor)
-            celula.border = THIN_BORDER
-            if col_idx in (3, 4) and isinstance(valor, (int, float)):
-                celula.number_format = MOEDA_FORMATO
-            if col_idx in (5, 6, 7):
-                celula.alignment = Alignment(horizontal="center")
-            if aprovado:
-                celula.fill = APROVADO_FILL
-                celula.font = APROVADO_FONT
+def _escrever_linha(ws, row_idx, item):
+    aprovado = item.get("aprovado", False)
+    decisao_texto = "Aprovado" if aprovado else "Não Aprovado"
 
+    valores = [
+        item.get("contrato") or "-",
+        item.get("nome") or "-",
+        item.get("liquido"),
+        item.get("data_proposta") or "-",
+        item.get("data_aprovacao_supervisor") or "",
+        decisao_texto,
+    ]
+    for col_idx, valor in enumerate(valores, start=1):
+        celula = ws.cell(row=row_idx, column=col_idx, value=valor)
+        celula.border = THIN_BORDER
+        if col_idx == 3 and isinstance(valor, (int, float)):
+            celula.number_format = MOEDA_FORMATO
+        if col_idx in (4, 5, 6):
+            celula.alignment = Alignment(horizontal="center")
+        celula.fill = APROVADO_FILL if aprovado else SEM_FILL
+        celula.font = APROVADO_FONT if aprovado else FONTE_PADRAO
+
+
+def gerar_relatorio(resultados, caminho):
+    """Gera/atualiza o relatorio com uma aba por ano (ano da Data de Cadastro).
+
+    Se o arquivo ja existir, ele e carregado e atualizado (nao sobrescreve
+    anos/propostas ja registrados). Uma proposta ja presente na aba do seu
+    ano (mesmo Codigo do Contrato) tem a linha atualizada em vez de duplicada.
+    """
+    if os.path.exists(caminho):
+        wb = load_workbook(caminho)
+    else:
+        wb = Workbook()
+
+    for item in resultados:
+        nome_aba = str(_ano_da_proposta(item))
+        ws = _obter_ou_criar_aba(wb, nome_aba)
+
+        contrato = item.get("contrato") or "-"
+        row_idx = None
+        if contrato != "-":
+            for r in range(2, ws.max_row + 1):
+                if ws.cell(row=r, column=1).value == contrato:
+                    row_idx = r
+                    break
+        if row_idx is None:
+            row_idx = ws.max_row + 1
+
+        _escrever_linha(ws, row_idx, item)
+
+    wb._sheets.sort(key=lambda ws: ws.title)
     wb.save(caminho)
 
 
