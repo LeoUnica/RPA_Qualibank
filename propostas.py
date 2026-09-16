@@ -18,7 +18,7 @@ CAMINHO_RELATORIO = os.path.join(PASTA_PROJETO, "resultado_simulacao.xlsx")
 
 DRY_RUN = True
 VALOR_LIMITE = 10_000.00
-MAX_PROPOSTAS = 10  # None = extrai todas as propostas da lista
+MAX_PROPOSTAS = None  # None = extrai todas as propostas da lista
 ITENS_POR_PAGINA = 50
 
 
