@@ -88,6 +88,27 @@ def _limpar_busca(page):
         page.wait_for_timeout(500)
 
 
+def _selecionar_todas_lojas(page):
+    """Abre o filtro 'Loja', marca 'Selecionar Todos' e atualiza a lista,
+    garantindo que a extracao enxergue propostas de todas as lojas."""
+    botao_loja = page.locator(
+        'xpath=//div[contains(@class,"text-base") and contains(@class,"text-secondary") '
+        'and normalize-space(text())="Loja"]/following-sibling::button[@aria-haspopup="menu"][1]'
+    )
+    if botao_loja.count() == 0:
+        return
+    botao_loja.click()
+    page.wait_for_timeout(500)
+
+    page.get_by_role("menuitem", name="Selecionar Todos", exact=True).click()
+    page.wait_for_timeout(500)
+
+    botao_refresh = page.locator('button:has(mat-icon[data-mat-icon-name="refresh"])').first
+    botao_refresh.click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+
+
 def _total_propostas(page):
     page.locator("table.app-table-search tbody tr.cursor-pointer").first.wait_for(
         state="visible", timeout=30000
@@ -147,6 +168,7 @@ def processar_propostas(page):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
     _limpar_busca(page)
+    _selecionar_todas_lojas(page)
 
     total = _total_propostas(page)
     n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
