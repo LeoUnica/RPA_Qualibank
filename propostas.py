@@ -132,10 +132,40 @@ def _selecionar_todas_lojas(page):
     page.get_by_role("menuitem", name="Selecionar Todos", exact=True).click()
     page.wait_for_timeout(500)
 
+    _marcar_status_aguardando_supervisor(page)
+
     botao_refresh = page.locator('button:has(mat-icon[data-mat-icon-name="refresh"])').first
     botao_refresh.click()
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
+
+
+def _marcar_status_aguardando_supervisor(page):
+    """Garante que o filtro de Status esteja marcado em 'Aguardando
+    aprovação do Supervisor'. Esse filtro pode ficar desmarcado entre uma
+    navegacao e outra, entao isso e checado (e corrigido, se preciso) toda
+    vez que a lista de propostas e recarregada, nunca so uma vez no inicio.
+    Se precisar corrigir, tambem atualiza a lista para refletir o filtro
+    certo antes de continuar."""
+    item = page.locator(
+        'xpath=//span[contains(@class,"flex-auto") and contains(@class,"text-sm") '
+        'and normalize-space(text())="Aguardando aprovação do Supervisor"]'
+    )
+    if item.count() == 0:
+        return
+
+    checkbox_input = item.locator('xpath=preceding-sibling::mat-checkbox[1]//input[@type="checkbox"]')
+    if checkbox_input.count() == 0 or checkbox_input.is_checked():
+        return
+
+    item.click()
+    page.wait_for_timeout(500)
+
+    botao_refresh = page.locator('button:has(mat-icon[data-mat-icon-name="refresh"])').first
+    if botao_refresh.count() > 0:
+        botao_refresh.click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
 
 
 def _total_propostas(page):
@@ -173,6 +203,7 @@ def _abrir_e_ler_proposta(page, i):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(800)
     _limpar_busca(page)
+    _marcar_status_aguardando_supervisor(page)
 
     for _ in range(pagina):
         _ir_proxima_pagina(page)
@@ -194,11 +225,21 @@ def _abrir_e_ler_proposta(page, i):
 CHECKPOINT_A_CADA = 20
 
 
-def processar_propostas(page, caminho_relatorio=None):
+def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False):
     """Se caminho_relatorio for informado, salva o relatorio periodicamente
     durante a execucao (a cada CHECKPOINT_A_CADA propostas), para nao perder
-    o progresso caso o script seja interrompido no meio de um lote grande."""
+    o progresso caso o script seja interrompido no meio de um lote grande.
+    Cada salvamento grava so as propostas novas desde o ultimo salvamento
+    (nunca a lista inteira de novo), para nao duplicar linhas quando
+    sempre_anexar=True."""
     resultados = []
+    ultimo_salvo = 0
+
+    def salvar_novos():
+        nonlocal ultimo_salvo
+        if caminho_relatorio and len(resultados) > ultimo_salvo:
+            gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio, sempre_anexar=sempre_anexar)
+            ultimo_salvo = len(resultados)
 
     page.goto(LOANS_URL)
     page.wait_for_load_state("networkidle")
@@ -212,16 +253,19 @@ def processar_propostas(page, caminho_relatorio=None):
 
     try:
         for i in range(n):
-            _processar_uma_proposta(page, i, resultados, caminho_relatorio)
+            _processar_uma_proposta(page, i, resultados)
+            if (i + 1) % CHECKPOINT_A_CADA == 0:
+                salvar_novos()
+                print(f"    [CHECKPOINT] relatorio salvo com {len(resultados)} propostas processadas ate agora.")
     finally:
-        if caminho_relatorio and resultados:
-            gerar_relatorio(resultados, caminho_relatorio)
+        salvar_novos()
+        if caminho_relatorio:
             print(f"    [CHECKPOINT FINAL] relatorio salvo com {len(resultados)} propostas.")
 
     return resultados
 
 
-def _processar_uma_proposta(page, i, resultados, caminho_relatorio):
+def _processar_uma_proposta(page, i, resultados):
     erro = None
     dados = None
     for tentativa in range(1, MAX_TENTATIVAS + 1):
@@ -291,10 +335,6 @@ def _processar_uma_proposta(page, i, resultados, caminho_relatorio):
             "aprovado": aprovado,
         }
     )
-
-    if caminho_relatorio and (i + 1) % CHECKPOINT_A_CADA == 0:
-        gerar_relatorio(resultados, caminho_relatorio)
-        print(f"    [CHECKPOINT] relatorio salvo com {len(resultados)} propostas processadas ate agora.")
 
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -384,7 +424,10 @@ def _escrever_linha(ws, row_idx, item):
         celula.font = APROVADO_FONT if aprovado else FONTE_PADRAO
 
 
-def gerar_relatorio(resultados, caminho):
+def gerar_relatorio(resultados, caminho, sempre_anexar=False):
+    """Se sempre_anexar for True, cada proposta vira sempre uma linha nova
+    no final da aba (nunca atualiza uma linha existente pelo contrato) -
+    usado no relatorio real, para manter o historico de todas as execucoes."""
 
     if os.path.exists(caminho):
         wb = load_workbook(caminho)
@@ -397,7 +440,7 @@ def gerar_relatorio(resultados, caminho):
 
         contrato = item.get("contrato") or "-"
         row_idx = None
-        if contrato != "-":
+        if not sempre_anexar and contrato != "-":
             for r in range(2, ws.max_row + 1):
                 if ws.cell(row=r, column=1).value == contrato:
                     row_idx = r
@@ -414,12 +457,14 @@ def gerar_relatorio(resultados, caminho):
 if __name__ == "__main__":
     os.makedirs(os.path.join(PASTA_PROJETO, "screenshots"), exist_ok=True)
     caminho_relatorio = CAMINHO_RELATORIO_SIMULACAO if DRY_RUN else CAMINHO_RELATORIO_REAL
+    sempre_anexar = not DRY_RUN
 
     with sync_playwright() as p:
         browser, page = login(p)
-        resultados = processar_propostas(page, caminho_relatorio=caminho_relatorio)
-
-        gerar_relatorio(resultados, caminho_relatorio)
-
-        print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
-        browser.close()
+        try:
+            resultados = processar_propostas(
+                page, caminho_relatorio=caminho_relatorio, sempre_anexar=sempre_anexar
+            )
+            print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
+        finally:
+            browser.close()
