@@ -14,7 +14,8 @@ _origin = urlparse(LOGIN_URL)
 LOANS_URL = f"{_origin.scheme}://{_origin.netloc}/loans"
 
 PASTA_PROJETO = os.path.dirname(os.path.abspath(__file__))
-CAMINHO_RELATORIO = os.path.join(PASTA_PROJETO, "resultado_simulacao.xlsx")
+CAMINHO_RELATORIO_SIMULACAO = os.path.join(PASTA_PROJETO, "resultado_simulacao.xlsx")
+CAMINHO_RELATORIO_REAL = os.path.join(PASTA_PROJETO, "resultado_aprovacoes.xlsx")
 
 DRY_RUN = True
 VALOR_LIMITE = 10_000.00
@@ -68,12 +69,40 @@ def ler_data_aprovacao_promotora(linha):
     return nota.inner_text().strip()
 
 
-def aprovar_proposta_real(page):
-    """NAO TESTADO. So deve ser chamado com DRY_RUN=False, apos validacao manual."""
+def ler_loja(linha):
+    """Le o nome da Loja direto na linha da lista (coluna Registro).
+    Nao existe campo equivalente na pagina de detalhe da proposta."""
+    valor = linha.locator(
+        'xpath=.//span[contains(@class,"ajin-label")][normalize-space(text())="Loja:"]'
+        '/following-sibling::span[contains(@class,"ajin-value")][1]'
+    )
+    if valor.count() == 0:
+        return ""
+    return valor.inner_text().strip()
+
+
+def aprovar_proposta_real(page, contrato):
+    """So deve ser chamado com DRY_RUN=False, apos validacao manual.
+    Se a aprovacao em si (Acoes -> Aprovacao Supervisor -> Confirmar) falhar,
+    a excecao propaga para o chamador tratar. Uma falha so nos prints de
+    evidencia (depois do Confirmar) NAO deve ser reportada como aprovacao
+    falha, senao um contrato ja aprovado de verdade seria reprocessado."""
     page.click('button:has-text("Ações")')
     page.get_by_text("Aprovação Supervisor", exact=True).click()
+    page.wait_for_timeout(500)
     page.fill("textarea[name='note']", "Aprovado via RPA")
-    # TODO: mapear o botao final de confirmar/enviar - etapa nunca executada.
+    page.get_by_role("button", name="Confirmar", exact=True).click()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
+
+    try:
+        page.screenshot(path=f"screenshots/aprovacao_{contrato}_proposta.png")
+        page.get_by_text("Histórico", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
+        page.screenshot(path=f"screenshots/aprovacao_{contrato}_historico.png")
+    except Exception as e:
+        print(f"    [AVISO] aprovacao do contrato {contrato} concluida, mas falha ao capturar prints de evidencia: {e}")
 
 
 def _limpar_busca(page):
@@ -150,6 +179,7 @@ def _abrir_e_ler_proposta(page, i):
 
     linha = page.locator("table.app-table-search tbody tr.cursor-pointer").nth(posicao)
     data_aprovacao_promotora = ler_data_aprovacao_promotora(linha)
+    loja = ler_loja(linha)
 
     linha.locator('button[aria-haspopup="menu"]').first.click()
     page.wait_for_timeout(400)
@@ -158,10 +188,16 @@ def _abrir_e_ler_proposta(page, i):
     page.wait_for_timeout(1000)
 
     contrato, nome, valor, liquido, data_proposta = ler_proposta(page)
-    return contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora
+    return contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora, loja
 
 
-def processar_propostas(page):
+CHECKPOINT_A_CADA = 20
+
+
+def processar_propostas(page, caminho_relatorio=None):
+    """Se caminho_relatorio for informado, salva o relatorio periodicamente
+    durante a execucao (a cada CHECKPOINT_A_CADA propostas), para nao perder
+    o progresso caso o script seja interrompido no meio de um lote grande."""
     resultados = []
 
     page.goto(LOANS_URL)
@@ -174,69 +210,91 @@ def processar_propostas(page):
     n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
     print(f"Processando {n} de {total} propostas listadas (DRY_RUN={DRY_RUN})...")
 
-    for i in range(n):
-        erro = None
-        dados = None
-        for tentativa in range(1, MAX_TENTATIVAS + 1):
-            try:
-                dados = _abrir_e_ler_proposta(page, i)
-                erro = None
-                break
-            except Exception as e:
-                erro = e
-                print(f"[{i}] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou: {e}")
-                if tentativa < MAX_TENTATIVAS:
-                    print(
-                        f"    Aguardando {ESPERA_ENTRE_TENTATIVAS_SEGUNDOS}s antes de "
-                        "tentar novamente (mesma sessao, sem novo login)..."
-                    )
-                    page.wait_for_timeout(ESPERA_ENTRE_TENTATIVAS_SEGUNDOS * 1000)
-
-        if erro is not None:
-            print(f"[{i}] Desistindo apos {MAX_TENTATIVAS} tentativas: {erro}")
-            resultados.append(
-                {
-                    "contrato": "?",
-                    "nome": "",
-                    "valor": None,
-                    "liquido": None,
-                    "data_proposta": "",
-                    "data_aprovacao_promotora": "",
-                    "data_aprovacao_supervisor": "",
-                    "aprovado": False,
-                }
-            )
-            continue
-
-        contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora = dados
-
-        aprovado = liquido <= VALOR_LIMITE
-        decisao = "APROVARIA" if aprovado else "PULA (valor > limite)"
-        print(f"[{i}] Contrato {contrato} - Valor Líquido: R$ {liquido:,.2f} -> {decisao}")
-
-        data_aprovacao_supervisor = ""
-        if aprovado:
-
-            data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
-            if DRY_RUN:
-                print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
-            else:
-                aprovar_proposta_real(page)
-
-        resultados.append(
-            {
-                "contrato": contrato,
-                "nome": nome,
-                "valor": valor,
-                "liquido": liquido,
-                "data_proposta": data_proposta,
-                "data_aprovacao_promotora": data_aprovacao_promotora,
-                "data_aprovacao_supervisor": data_aprovacao_supervisor,
-                "aprovado": aprovado,
-            }
-        )
+    try:
+        for i in range(n):
+            _processar_uma_proposta(page, i, resultados, caminho_relatorio)
+    finally:
+        if caminho_relatorio and resultados:
+            gerar_relatorio(resultados, caminho_relatorio)
+            print(f"    [CHECKPOINT FINAL] relatorio salvo com {len(resultados)} propostas.")
 
     return resultados
+
+
+def _processar_uma_proposta(page, i, resultados, caminho_relatorio):
+    erro = None
+    dados = None
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            dados = _abrir_e_ler_proposta(page, i)
+            erro = None
+            break
+        except Exception as e:
+            erro = e
+            print(f"[{i}] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou: {e}")
+            if tentativa < MAX_TENTATIVAS:
+                print(
+                    f"    Aguardando {ESPERA_ENTRE_TENTATIVAS_SEGUNDOS}s antes de "
+                    "tentar novamente (mesma sessao, sem novo login)..."
+                )
+                page.wait_for_timeout(ESPERA_ENTRE_TENTATIVAS_SEGUNDOS * 1000)
+
+    if erro is not None:
+        print(f"[{i}] Desistindo apos {MAX_TENTATIVAS} tentativas: {erro}")
+        resultados.append(
+            {
+                "contrato": "?",
+                "nome": "",
+                "loja": "",
+                "valor": None,
+                "liquido": None,
+                "data_proposta": "",
+                "data_aprovacao_promotora": "",
+                "data_aprovacao_supervisor": "",
+                "aprovado": False,
+            }
+        )
+        return
+
+    contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora, loja = dados
+
+    elegivel = liquido <= VALOR_LIMITE
+    decisao = "APROVARIA" if elegivel else "PULA (valor > limite)"
+    print(f"[{i}] Contrato {contrato} - Valor Líquido: R$ {liquido:,.2f} -> {decisao}")
+
+    data_aprovacao_supervisor = ""
+    aprovado = False
+    if elegivel:
+        if DRY_RUN:
+            data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
+            aprovado = True
+            print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
+        else:
+            try:
+                aprovar_proposta_real(page, contrato)
+                data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
+                aprovado = True
+            except Exception as e:
+                data_aprovacao_supervisor = f"ERRO: {e}"
+                print(f"    [ERRO] falha ao aprovar de verdade o contrato {contrato}: {e}")
+
+    resultados.append(
+        {
+            "contrato": contrato,
+            "nome": nome,
+            "loja": loja,
+            "valor": valor,
+            "liquido": liquido,
+            "data_proposta": data_proposta,
+            "data_aprovacao_promotora": data_aprovacao_promotora,
+            "data_aprovacao_supervisor": data_aprovacao_supervisor,
+            "aprovado": aprovado,
+        }
+    )
+
+    if caminho_relatorio and (i + 1) % CHECKPOINT_A_CADA == 0:
+        gerar_relatorio(resultados, caminho_relatorio)
+        print(f"    [CHECKPOINT] relatorio salvo com {len(resultados)} propostas processadas ate agora.")
 
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -256,6 +314,7 @@ COLUNAS_RELATORIO = [
     ("Data e Horário Aguardando Aprovação Promotora", 32),
     ("Data e Horário da Aprovação do Supervisor", 30),
     ("Decisão", 22),
+    ("Loja", 26),
 ]
 
 
@@ -267,9 +326,26 @@ def _ano_da_proposta(item):
         return datetime.now().year
 
 
+def _escrever_cabecalho(ws):
+    """Escreve os cabecalhos de COLUNAS_RELATORIO que ainda nao existem na
+    aba. Cobre tanto uma aba nova quanto uma aba criada por uma execucao
+    anterior do script, que pode nao ter as colunas mais recentes."""
+    for col_idx, (titulo, largura) in enumerate(COLUNAS_RELATORIO, start=1):
+        if ws.cell(row=1, column=col_idx).value:
+            continue
+        celula = ws.cell(row=1, column=col_idx, value=titulo)
+        celula.fill = HEADER_FILL
+        celula.font = HEADER_FONT
+        celula.alignment = Alignment(horizontal="center", vertical="center")
+        celula.border = THIN_BORDER
+        ws.column_dimensions[get_column_letter(col_idx)].width = largura
+
+
 def _obter_ou_criar_aba(wb, nome_aba):
     if nome_aba in wb.sheetnames:
-        return wb[nome_aba]
+        ws = wb[nome_aba]
+        _escrever_cabecalho(ws)
+        return ws
 
     # Reaproveita a aba padrao "Sheet" vazia da primeira criacao do workbook.
     if wb.sheetnames == ["Sheet"] and wb["Sheet"].max_row == 1 and wb["Sheet"]["A1"].value is None:
@@ -278,14 +354,8 @@ def _obter_ou_criar_aba(wb, nome_aba):
     else:
         ws = wb.create_sheet(nome_aba)
 
-    for col_idx, (titulo, largura) in enumerate(COLUNAS_RELATORIO, start=1):
-        celula = ws.cell(row=1, column=col_idx, value=titulo)
-        celula.fill = HEADER_FILL
-        celula.font = HEADER_FONT
-        celula.alignment = Alignment(horizontal="center", vertical="center")
-        celula.border = THIN_BORDER
-        ws.column_dimensions[get_column_letter(col_idx)].width = largura
     ws.freeze_panes = "A2"
+    _escrever_cabecalho(ws)
     return ws
 
 
@@ -301,6 +371,7 @@ def _escrever_linha(ws, row_idx, item):
         item.get("data_aprovacao_promotora") or "",
         item.get("data_aprovacao_supervisor") or "",
         decisao_texto,
+        item.get("loja") or "-",
     ]
     for col_idx, valor in enumerate(valores, start=1):
         celula = ws.cell(row=row_idx, column=col_idx, value=valor)
@@ -342,11 +413,13 @@ def gerar_relatorio(resultados, caminho):
 
 if __name__ == "__main__":
     os.makedirs(os.path.join(PASTA_PROJETO, "screenshots"), exist_ok=True)
+    caminho_relatorio = CAMINHO_RELATORIO_SIMULACAO if DRY_RUN else CAMINHO_RELATORIO_REAL
+
     with sync_playwright() as p:
         browser, page = login(p)
-        resultados = processar_propostas(page)
+        resultados = processar_propostas(page, caminho_relatorio=caminho_relatorio)
 
-        gerar_relatorio(resultados, CAMINHO_RELATORIO)
+        gerar_relatorio(resultados, caminho_relatorio)
 
-        print(f"\nRelatorio salvo em {CAMINHO_RELATORIO} ({len(resultados)} propostas).")
+        print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
         browser.close()

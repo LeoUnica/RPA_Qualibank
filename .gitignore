@@ -6,4 +6,5 @@ screenshots/
 *.log
 resultado_simulacao.csv
 resultado_simulacao.xlsx
+resultado_aprovacoes.xlsx
 ~$*.xlsx
