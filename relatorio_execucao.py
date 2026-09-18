@@ -146,7 +146,7 @@ class Metricas:
     total_encontradas: int = 0
     tentativas_reprocessamento: int = 0
     erro_critico: Optional[str] = None
-    dry_run: bool = True
+    dry_run: bool = False
 
     def calcular(self, resultados: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Consolida as metricas executivas a partir da lista de resultados

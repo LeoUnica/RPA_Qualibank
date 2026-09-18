@@ -10,11 +10,12 @@ Rodar com: python teste_email_relatorio.py
 """
 
 import os
+import sys
 from datetime import datetime, timedelta
 
 from openpyxl import Workbook
 
-from email_outlook_web import enviar_email_outlook_web
+from envio_email import enviar_relatorio
 from relatorio_execucao import (
     DESTINATARIO_PADRAO,
     Metricas,
@@ -105,6 +106,9 @@ def main():
     logger, caminho_log, timestamp = setup_logging(PASTA_PROJETO)
     logger.info("=== INÍCIO DO ENVIO DE TESTE (dados fictícios, nenhuma proposta real) ===")
 
+    # Uso: python teste_email_relatorio.py [destinatario]  (padrão: DESTINATARIO_PADRAO)
+    destinatario = sys.argv[1] if len(sys.argv) > 1 else DESTINATARIO_PADRAO
+
     resultados = _resultados_ficticios()
 
     metricas = Metricas(
@@ -126,14 +130,13 @@ def main():
     corpo_html = gerar_relatorio_html(stats, resultados, nota_topo=NOTA_TOPO)
     assunto = f"[Teste] [RPA Qualibank] Execução Concluída - {stats['fim_dt'].strftime('%d/%m/%Y %H:%M')}"
 
-    print("\nAbrindo o navegador no Outlook Web. O login com a conta de automação "
-          "é automático; se pedir verificação adicional (MFA), conclua na janela "
-          "que vai abrir - você tem até 15 minutos.")
-    enviar_email_outlook_web(
-        corpo_html, anexos, assunto=assunto, destinatario=DESTINATARIO_PADRAO,
-        headless=False, logger=logger,
+    print("\nEnviando pelo Outlook desktop (plano B: Outlook Web, com login automático; "
+          "se pedir MFA, conclua na janela que abrir - você tem até 15 minutos).")
+    metodo = enviar_relatorio(
+        corpo_html, anexos, assunto=assunto, destinatario=destinatario,
+        logger=logger,
     )
-    logger.info("E-mail de TESTE enviado com sucesso via Outlook Web.")
+    logger.info(f"E-mail de TESTE enviado com sucesso (método: {metodo}).")
     print(f"\nE-mail de teste enviado. Anexos: {anexos}")
 
 

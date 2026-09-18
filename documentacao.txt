@@ -20,7 +20,7 @@ decide "Aprovado". A "Data e Horario da Proposta" vem da secao real
 "Log do Registro" -> "Data de Cadastro" de cada proposta.
 
 A funcao aprovar_proposta_real() faz o clique de aprovacao real (Acoes ->
-Aprovacao Supervisor -> observacao "Aprovado via RPA"), mas foi escrita
+Aprovacao Supervisor -> observacao "Aprovado via regra - RPA"), mas foi escrita
 apenas a partir da especificacao recebida - NUNCA foi executada nem
 testada contra o site, porque isso aprovaria uma proposta real em
 producao. Falta inclusive mapear o botao final de confirmar/enviar.
