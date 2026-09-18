@@ -2,7 +2,11 @@
 __pycache__/
 *.pyc
 .env
+.claude/
 screenshots/
+logs/
+outlook_profile/
+rpa.lock
 *.log
 resultado_simulacao.csv
 resultado_simulacao.xlsx

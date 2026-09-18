@@ -1,14 +1,29 @@
+import logging
 import os
 import re
+import socket
 from datetime import datetime
 from urllib.parse import urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+from email_outlook_web import enviar_email_outlook_web
 from login import login, URL as LOGIN_URL
+from relatorio_execucao import (
+    DESTINATARIO_PADRAO,
+    Metricas,
+    adquirir_lock_execucao,
+    coletar_anexos,
+    gerar_relatorio_html,
+    liberar_lock_execucao,
+    registrar_metricas,
+    salvar_estatisticas,
+    setup_logging,
+    status_execucao,
+)
 
 _origin = urlparse(LOGIN_URL)
 LOANS_URL = f"{_origin.scheme}://{_origin.netloc}/loans"
@@ -21,6 +36,18 @@ DRY_RUN = True
 VALOR_LIMITE = 10_000.00
 MAX_PROPOSTAS = None  # None = extrai todas as propostas da lista
 ITENS_POR_PAGINA = 50
+
+logger = logging.getLogger("rpa_qualibank.propostas")
+
+
+def _classificar_erro(e: Exception) -> str:
+    """Classifica uma excecao para fins de log (nao influencia a logica de
+    negocio, apenas o rotulo usado na mensagem registrada)."""
+    if isinstance(e, PlaywrightTimeoutError):
+        return "timeout"
+    if isinstance(e, (AttributeError, ValueError, IndexError)):
+        return "leitura"
+    return "navegacao"
 
 
 def parse_valor_brl(texto):
@@ -87,6 +114,7 @@ def aprovar_proposta_real(page, contrato):
     a excecao propaga para o chamador tratar. Uma falha so nos prints de
     evidencia (depois do Confirmar) NAO deve ser reportada como aprovacao
     falha, senao um contrato ja aprovado de verdade seria reprocessado."""
+    logger.info(f"Iniciando aprovação real do contrato {contrato} (Ações -> Aprovação Supervisor).")
     page.click('button:has-text("Ações")')
     page.get_by_text("Aprovação Supervisor", exact=True).click()
     page.wait_for_timeout(500)
@@ -94,6 +122,7 @@ def aprovar_proposta_real(page, contrato):
     page.get_by_role("button", name="Confirmar", exact=True).click()
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
+    logger.info(f"Aprovação confirmada no sistema para o contrato {contrato}.")
 
     try:
         page.screenshot(path=f"screenshots/aprovacao_{contrato}_proposta.png")
@@ -102,7 +131,7 @@ def aprovar_proposta_real(page, contrato):
         page.wait_for_timeout(1000)
         page.screenshot(path=f"screenshots/aprovacao_{contrato}_historico.png")
     except Exception as e:
-        print(f"    [AVISO] aprovacao do contrato {contrato} concluida, mas falha ao capturar prints de evidencia: {e}")
+        logger.warning(f"Aprovação do contrato {contrato} concluída, mas falha ao capturar prints de evidência: {e}")
 
 
 def _limpar_busca(page):
@@ -225,13 +254,18 @@ def _abrir_e_ler_proposta(page, i):
 CHECKPOINT_A_CADA = 20
 
 
-def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False):
+def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metricas=None):
     """Se caminho_relatorio for informado, salva o relatorio periodicamente
     durante a execucao (a cada CHECKPOINT_A_CADA propostas), para nao perder
     o progresso caso o script seja interrompido no meio de um lote grande.
     Cada salvamento grava so as propostas novas desde o ultimo salvamento
     (nunca a lista inteira de novo), para nao duplicar linhas quando
-    sempre_anexar=True."""
+    sempre_anexar=True.
+
+    `metricas`, se informado (instancia de relatorio_execucao.Metricas), e
+    apenas alimentado com dados que nao dá para derivar depois da lista de
+    resultados (total encontrado, tentativas de reprocessamento) - nao afeta
+    nenhuma decisao de aprovacao."""
     resultados = []
     ultimo_salvo = 0
 
@@ -241,6 +275,7 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False):
             gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio, sempre_anexar=sempre_anexar)
             ultimo_salvo = len(resultados)
 
+    logger.info(f"Entrando na tela de propostas: {LOANS_URL}")
     page.goto(LOANS_URL)
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
@@ -249,23 +284,25 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False):
 
     total = _total_propostas(page)
     n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
-    print(f"Processando {n} de {total} propostas listadas (DRY_RUN={DRY_RUN})...")
+    if metricas is not None:
+        metricas.total_encontradas = total
+    logger.info(f"Propostas encontradas: {total}. Processando {n} (DRY_RUN={DRY_RUN}).")
 
     try:
         for i in range(n):
-            _processar_uma_proposta(page, i, resultados)
+            _processar_uma_proposta(page, i, resultados, metricas=metricas)
             if (i + 1) % CHECKPOINT_A_CADA == 0:
                 salvar_novos()
-                print(f"    [CHECKPOINT] relatorio salvo com {len(resultados)} propostas processadas ate agora.")
+                logger.info(f"[CHECKPOINT] relatório salvo com {len(resultados)} propostas processadas até agora.")
     finally:
         salvar_novos()
         if caminho_relatorio:
-            print(f"    [CHECKPOINT FINAL] relatorio salvo com {len(resultados)} propostas.")
+            logger.info(f"[CHECKPOINT FINAL] relatório salvo com {len(resultados)} propostas.")
 
     return resultados
 
 
-def _processar_uma_proposta(page, i, resultados):
+def _processar_uma_proposta(page, i, resultados, metricas=None):
     erro = None
     dados = None
     for tentativa in range(1, MAX_TENTATIVAS + 1):
@@ -275,16 +312,20 @@ def _processar_uma_proposta(page, i, resultados):
             break
         except Exception as e:
             erro = e
-            print(f"[{i}] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou: {e}")
+            tipo_erro = _classificar_erro(e)
+            logger.warning(f"[{i}] Tentativa {tentativa}/{MAX_TENTATIVAS} falhou ({tipo_erro}): {e}")
             if tentativa < MAX_TENTATIVAS:
-                print(
+                if metricas is not None:
+                    metricas.tentativas_reprocessamento += 1
+                logger.info(
                     f"    Aguardando {ESPERA_ENTRE_TENTATIVAS_SEGUNDOS}s antes de "
                     "tentar novamente (mesma sessao, sem novo login)..."
                 )
                 page.wait_for_timeout(ESPERA_ENTRE_TENTATIVAS_SEGUNDOS * 1000)
 
     if erro is not None:
-        print(f"[{i}] Desistindo apos {MAX_TENTATIVAS} tentativas: {erro}")
+        tipo_erro = _classificar_erro(erro)
+        logger.error(f"[{i}] Desistindo após {MAX_TENTATIVAS} tentativas ({tipo_erro}): {erro}")
         resultados.append(
             {
                 "contrato": "?",
@@ -301,10 +342,11 @@ def _processar_uma_proposta(page, i, resultados):
         return
 
     contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora, loja = dados
+    logger.info(f"[{i}] Contrato {contrato} | Cliente: {nome} | Loja: {loja} | Valor Líquido: R$ {liquido:,.2f}")
 
     elegivel = liquido <= VALOR_LIMITE
     decisao = "APROVARIA" if elegivel else "PULA (valor > limite)"
-    print(f"[{i}] Contrato {contrato} - Valor Líquido: R$ {liquido:,.2f} -> {decisao}")
+    logger.info(f"[{i}] Contrato {contrato} -> {decisao}")
 
     data_aprovacao_supervisor = ""
     aprovado = False
@@ -312,15 +354,18 @@ def _processar_uma_proposta(page, i, resultados):
         if DRY_RUN:
             data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
             aprovado = True
-            print("    [DRY-RUN] nao clicou em Acoes/Aprovacao Supervisor.")
+            logger.info(f"[DRY-RUN] Aprovação simulada para o contrato {contrato} (não clicou em Ações/Aprovação Supervisor).")
         else:
             try:
                 aprovar_proposta_real(page, contrato)
                 data_aprovacao_supervisor = datetime.now().strftime("%d/%m/%Y %H:%M")
                 aprovado = True
+                logger.info(f"Aprovação realizada com sucesso para o contrato {contrato}.")
             except Exception as e:
                 data_aprovacao_supervisor = f"ERRO: {e}"
-                print(f"    [ERRO] falha ao aprovar de verdade o contrato {contrato}: {e}")
+                logger.error(f"Erro de aprovação no contrato {contrato}: {e}")
+    else:
+        logger.info(f"Proposta ignorada: contrato {contrato} (valor líquido acima do limite de R$ {VALOR_LIMITE:,.2f}).")
 
     resultados.append(
         {
@@ -454,17 +499,76 @@ def gerar_relatorio(resultados, caminho, sempre_anexar=False):
     wb.save(caminho)
 
 
+def _executar_rpa(metricas: Metricas, caminho_relatorio: str, sempre_anexar: bool) -> list:
+    """Executa o fluxo principal do RPA (login + processamento das
+    propostas). Isolado em funcao propria para que o bloco __main__ possa
+    envolve-lo num try/except/finally unico que sempre gera o relatorio e
+    envia o e-mail, sem alterar a logica de aprovacao em si."""
+    with sync_playwright() as p:
+        browser, page = login(p)
+        try:
+            return processar_propostas(
+                page,
+                caminho_relatorio=caminho_relatorio,
+                sempre_anexar=sempre_anexar,
+                metricas=metricas,
+            )
+        finally:
+            browser.close()
+
+
 if __name__ == "__main__":
     os.makedirs(os.path.join(PASTA_PROJETO, "screenshots"), exist_ok=True)
     caminho_relatorio = CAMINHO_RELATORIO_SIMULACAO if DRY_RUN else CAMINHO_RELATORIO_REAL
     sempre_anexar = not DRY_RUN
 
-    with sync_playwright() as p:
-        browser, page = login(p)
+    _, caminho_log, timestamp_execucao = setup_logging(PASTA_PROJETO)
+
+    # O agendador dispara uma nova execucao a cada 10 minutos, independente
+    # da anterior ja ter terminado. Sem esse lock, uma execucao anterior
+    # travada (ex.: aguardando MFA, pagina lenta) e a nova disparada em cima
+    # dela tentariam logar ao mesmo tempo na mesma conta. Se ja houver uma
+    # execucao rodando, esta encerra IMEDIATAMENTE, antes de qualquer
+    # tentativa de login.
+    if not adquirir_lock_execucao(PASTA_PROJETO):
+        logger.warning(
+            "Já existe uma execução do RPA em andamento neste momento - "
+            "pulando este ciclo (nenhum login será tentado) para não rodar duas sessões em paralelo."
+        )
+        logging.shutdown()
+        raise SystemExit(0)
+
+    metricas = Metricas(dry_run=DRY_RUN)
+    resultados: list = []
+
+    try:
+        resultados = _executar_rpa(metricas, caminho_relatorio, sempre_anexar)
+        logger.info(f"Relatório salvo em {caminho_relatorio} ({len(resultados)} propostas).")
+    except Exception as e:
+        metricas.erro_critico = str(e)
+        logger.critical(f"Falha inesperada na execução do RPA: {e}", exc_info=True)
+    finally:
+        metricas.fim = datetime.now()
+        stats = metricas.calcular(resultados)
+        registrar_metricas(logger, stats)
+        salvar_estatisticas(stats, PASTA_PROJETO, timestamp_execucao)
+
+        anexos = coletar_anexos(caminho_log, caminho_relatorio, PASTA_PROJETO)
+        corpo_html = gerar_relatorio_html(stats, resultados)
+        _, status_texto_geral, _ = status_execucao(stats)
+        assunto = (
+            f"[RPA Qualibank] {status_texto_geral} — "
+            f"{stats['fim_dt'].strftime('%d/%m/%Y %H:%M')} ({socket.gethostname()})"
+        )
+
         try:
-            resultados = processar_propostas(
-                page, caminho_relatorio=caminho_relatorio, sempre_anexar=sempre_anexar
+            enviar_email_outlook_web(
+                corpo_html, anexos, assunto=assunto, destinatario=DESTINATARIO_PADRAO,
+                headless=False, logger=logger,
             )
-            print(f"\nRelatorio salvo em {caminho_relatorio} ({len(resultados)} propostas).")
-        finally:
-            browser.close()
+            logger.info("E-mail de relatório de execução enviado com sucesso via Outlook Web.")
+        except Exception as e:
+            logger.error(f"Falha ao enviar e-mail de relatório via Outlook Web: {e}", exc_info=True)
+
+        liberar_lock_execucao(PASTA_PROJETO)
+        logging.shutdown()

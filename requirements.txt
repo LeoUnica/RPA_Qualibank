@@ -1,3 +1,4 @@
 playwright
 python-dotenv
 openpyxl
+pywin32

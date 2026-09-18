@@ -1,4 +1,5 @@
 
+import logging
 import os
 import sys
 
@@ -10,6 +11,8 @@ load_dotenv()
 URL = os.environ["QUALI_URL"]
 ACCESS_ID = os.environ["QUALI_ACCESS_ID"]
 PASSWORD = os.environ["QUALI_PASSWORD"]
+
+logger = logging.getLogger("rpa_qualibank.login")
 
 
 def login(playwright):
@@ -27,7 +30,7 @@ def login(playwright):
     page.get_by_text("Login", exact=True).click()
 
     page.wait_for_load_state("networkidle")
-    print(f"URL apos login: {page.url}")
+    logger.info(f"Login realizado. URL apos login: {page.url}")
 
     close_notificacao(page)
 
@@ -41,6 +44,7 @@ def close_notificacao(page, timeout=8000):
     try:
         dialog.wait_for(state="visible", timeout=timeout)
     except Exception:
+        logger.info("Nenhuma notificação pendente ao entrar no portal.")
         return False
 
     corpo = dialog.locator("div.overflow-y-auto").first
@@ -50,6 +54,7 @@ def close_notificacao(page, timeout=8000):
     botao_confirmar = dialog.locator('button[mat-flat-button][color="primary"]')
     botao_confirmar.click(timeout=timeout)
     dialog.wait_for(state="hidden", timeout=timeout)
+    logger.info("Notificação de aviso fechada com sucesso.")
     return True
 
 
