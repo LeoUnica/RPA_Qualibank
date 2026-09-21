@@ -425,10 +425,15 @@ def coletar_anexos(
     caminho_log: Optional[str],
     caminho_relatorio: Optional[str],
     pasta_projeto: str,
+    desde: Optional[datetime] = None,
 ) -> List[str]:
     """Reune os caminhos dos arquivos a anexar no e-mail: log da execucao,
     planilha de resultado (simulacao ou aprovacoes reais) e todos os
-    screenshots produzidos em screenshots/."""
+    screenshots produzidos em screenshots/.
+
+    Se `desde` for informado, so entram os screenshots gerados a partir
+    desse instante (o inicio do ciclo atual), para o e-mail nao carregar
+    evidencias de ciclos anteriores."""
     anexos: List[str] = []
 
     if caminho_log and os.path.isfile(caminho_log):
@@ -440,8 +445,12 @@ def coletar_anexos(
     pasta_screenshots = os.path.join(pasta_projeto, "screenshots")
     if os.path.isdir(pasta_screenshots):
         for nome in sorted(os.listdir(pasta_screenshots)):
-            if nome.lower().endswith(".png"):
-                anexos.append(os.path.join(pasta_screenshots, nome))
+            if not nome.lower().endswith(".png"):
+                continue
+            caminho = os.path.join(pasta_screenshots, nome)
+            if desde is not None and datetime.fromtimestamp(os.path.getmtime(caminho)) < desde:
+                continue
+            anexos.append(caminho)
 
     return anexos
 

@@ -34,7 +34,6 @@ CAMINHO_RELATORIO = os.path.join(PASTA_PROJETO, "resultado_aprovacoes.xlsx")
 
 VALOR_LIMITE = 10_000.00
 MAX_PROPOSTAS = None  # None = extrai todas as propostas da lista
-ITENS_POR_PAGINA = 50
 
 logger = logging.getLogger("rpa_qualibank.propostas")
 
@@ -105,6 +104,60 @@ def ler_loja(linha):
     if valor.count() == 0:
         return ""
     return valor.inner_text().strip()
+
+
+STATUS_ELEGIVEL = "Aguardando aprovação do Supervisor"
+
+
+def _ler_codigo_contrato(linha):
+    """Le o codigo do contrato (ex.: QUA0002687158) direto na linha da
+    lista. E o identificador usado para localizar a proposta de novo mais
+    tarde - nunca a posicao dela na lista, que muda conforme propostas
+    aprovadas saem da fila."""
+    valor = linha.locator(
+        'xpath=.//span[contains(@class,"ajin-value")][starts-with(normalize-space(text()),"QUA")]'
+    ).first
+    if valor.count() == 0:
+        return ""
+    return valor.inner_text().strip()
+
+
+def _ler_status_lista(linha):
+    """Le o status atual da proposta direto na linha da lista (bloco exibido
+    ao lado do filtro de Status, ex.: 'Aguardando aprovação do Supervisor').
+    E diferente do status mostrado em ajin-status-label[name="operationStatus"],
+    que registra uma etapa anterior do fluxo (Aprovacao Promotora) e pode
+    continuar visivel mesmo depois que a proposta avancou de status."""
+    valor = linha.locator(
+        'xpath=.//div[contains(@class,"border-l-2")]'
+        '//span[contains(@class,"leading-none")][1]'
+    )
+    if valor.count() == 0:
+        return ""
+    return valor.first.inner_text().strip()
+
+
+class ContratoForaDaFila(Exception):
+    """A proposta nao esta mais na lista de 'Aguardando aprovacao do
+    Supervisor' (por exemplo, ja foi aprovada em execucao anterior ou
+    manualmente e saiu da fila). Nao e um erro: nao deve ser reprocessada
+    nem contar como falha."""
+
+
+class ContratoStatusDivergente(Exception):
+    """A linha localizada pelo codigo esta com um status diferente do
+    esperado. Protege contra abrir e aprovar propostas de outro status que
+    porventura tambem esteja marcado no filtro da conta (ex.: 'Saldo
+    Retornado - Aguardando Aprovação do Supervisor'). Nao e um erro: nao
+    deve ser reprocessada nem contar como falha."""
+
+    def __init__(self, codigo, status_encontrado):
+        self.codigo = codigo
+        self.status_encontrado = status_encontrado
+        super().__init__(
+            f"Contrato {codigo}: status atual é '{status_encontrado}', "
+            f"esperado '{STATUS_ELEGIVEL}'."
+        )
 
 
 def aprovar_proposta_real(page, contrato):
@@ -209,13 +262,62 @@ def _total_propostas(page):
     return max(total, linhas_na_pagina)
 
 
-def _ir_proxima_pagina(page):
-    botao = page.locator(
+def _botao_proxima_pagina(page):
+    return page.locator(
         'ajin-search-pagination button:has(mat-icon[data-mat-icon-name="arrow_forward_ios"])'
-    )
-    botao.click()
+    ).first
+
+
+def _tem_proxima_pagina(page):
+    botao = _botao_proxima_pagina(page)
+    return botao.count() > 0 and botao.is_enabled()
+
+
+def _ir_proxima_pagina(page):
+    _botao_proxima_pagina(page).click()
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(800)
+
+
+def _listar_codigos(page):
+    """Percorre todas as paginas da lista (ja filtrada por Status =
+    'Aguardando aprovação do Supervisor') e devolve os codigos de contrato
+    na ordem em que aparecem. Essa lista e o roteiro do processamento: cada
+    proposta e localizada de novo pelo codigo (nunca pela posicao), entao
+    uma proposta que sai da fila entre uma leitura e a proxima nao desalinha
+    as demais."""
+    codigos = []
+    while True:
+        linhas = page.locator("table.app-table-search tbody tr.cursor-pointer")
+        for idx in range(linhas.count()):
+            codigo = _ler_codigo_contrato(linhas.nth(idx))
+            if codigo:
+                codigos.append(codigo)
+        if not _tem_proxima_pagina(page):
+            break
+        _ir_proxima_pagina(page)
+    return codigos
+
+
+def _localizar_linha_por_codigo(page, codigo):
+    """Recarrega a lista e procura, pagina por pagina, a linha cujo codigo de
+    contrato e `codigo`. Devolve o locator da linha, ja na pagina correta, ou
+    None se a proposta nao estiver mais na lista (saiu da fila)."""
+    page.goto(LOANS_URL)
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(800)
+    _limpar_busca(page)
+    _marcar_status_aguardando_supervisor(page)
+
+    while True:
+        linhas = page.locator("table.app-table-search tbody tr.cursor-pointer")
+        for idx in range(linhas.count()):
+            linha = linhas.nth(idx)
+            if _ler_codigo_contrato(linha) == codigo:
+                return linha
+        if not _tem_proxima_pagina(page):
+            return None
+        _ir_proxima_pagina(page)
 
 
 MAX_TENTATIVAS = 5
@@ -227,20 +329,22 @@ MAX_FALHAS_CONSECUTIVAS = 2
 ESPERA_ENTRE_TENTATIVAS_SEGUNDOS = 120
 
 
-def _abrir_e_ler_proposta(page, i):
-    pagina = i // ITENS_POR_PAGINA
-    posicao = i % ITENS_POR_PAGINA
+def _abrir_e_ler_proposta(page, codigo):
+    """Localiza a proposta pelo codigo do contrato (nunca pela posicao na
+    lista) e abre o detalhe.
 
-    page.goto(LOANS_URL)
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(800)
-    _limpar_busca(page)
-    _marcar_status_aguardando_supervisor(page)
+    Levanta ContratoForaDaFila se o codigo nao estiver mais na lista, e
+    ContratoStatusDivergente se a linha encontrada nao estiver com o status
+    'Aguardando aprovação do Supervisor' - em ambos os casos o chamador nao
+    deve tratar como falha nem reprocessar."""
+    linha = _localizar_linha_por_codigo(page, codigo)
+    if linha is None:
+        raise ContratoForaDaFila(codigo)
 
-    for _ in range(pagina):
-        _ir_proxima_pagina(page)
+    status_lista = _ler_status_lista(linha)
+    if status_lista != STATUS_ELEGIVEL:
+        raise ContratoStatusDivergente(codigo, status_lista)
 
-    linha = page.locator("table.app-table-search tbody tr.cursor-pointer").nth(posicao)
     data_aprovacao_promotora = ler_data_aprovacao_promotora(linha)
     loja = ler_loja(linha)
 
@@ -257,13 +361,13 @@ def _abrir_e_ler_proposta(page, i):
 CHECKPOINT_A_CADA = 20
 
 
-def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metricas=None):
+def processar_propostas(page, caminho_relatorio=None, metricas=None):
     """Se caminho_relatorio for informado, salva o relatorio periodicamente
     durante a execucao (a cada CHECKPOINT_A_CADA propostas), para nao perder
     o progresso caso o script seja interrompido no meio de um lote grande.
     Cada salvamento grava so as propostas novas desde o ultimo salvamento
-    (nunca a lista inteira de novo), para nao duplicar linhas quando
-    sempre_anexar=True.
+    (nunca a lista inteira de novo). A planilha nunca duplica contratos
+    (ver gerar_relatorio).
 
     `metricas`, se informado (instancia de relatorio_execucao.Metricas), e
     apenas alimentado com dados que nao dá para derivar depois da lista de
@@ -275,7 +379,7 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metri
     def salvar_novos():
         nonlocal ultimo_salvo
         if caminho_relatorio and len(resultados) > ultimo_salvo:
-            gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio, sempre_anexar=sempre_anexar)
+            gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio)
             ultimo_salvo = len(resultados)
 
     logger.info(f"Entrando na tela de propostas: {LOANS_URL}")
@@ -285,11 +389,14 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metri
     _limpar_busca(page)
     _selecionar_todas_lojas(page)
 
-    total = _total_propostas(page)
-    n = total if MAX_PROPOSTAS is None else min(total, MAX_PROPOSTAS)
+    _total_propostas(page)  # garante que a tabela carregou antes de listar os codigos
+    codigos = _listar_codigos(page)
+    if MAX_PROPOSTAS is not None:
+        codigos = codigos[:MAX_PROPOSTAS]
+    n = len(codigos)
     if metricas is not None:
-        metricas.total_encontradas = total
-    logger.info(f"Propostas encontradas: {total}. Processando {n}.")
+        metricas.total_encontradas = n
+    logger.info(f"Propostas encontradas: {n}. Processando {n}.")
 
     ultimo_progresso = time.monotonic()
     falhas_consecutivas = 0
@@ -298,9 +405,11 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metri
         return time.monotonic() - ultimo_progresso > TEMPO_MAX_SEM_PROGRESSO_SEGUNDOS
 
     try:
-        for i in range(n):
-            _processar_uma_proposta(page, i, resultados, metricas=metricas, deve_abortar=sem_progresso)
-            if resultados[-1]["contrato"] == "?":
+        for i, codigo in enumerate(codigos):
+            status = _processar_uma_proposta(
+                page, i, codigo, resultados, metricas=metricas, deve_abortar=sem_progresso
+            )
+            if status == "erro":
                 falhas_consecutivas += 1
             else:
                 falhas_consecutivas = 0
@@ -329,14 +438,35 @@ def processar_propostas(page, caminho_relatorio=None, sempre_anexar=False, metri
     return resultados
 
 
-def _processar_uma_proposta(page, i, resultados, metricas=None, deve_abortar=None):
+def _processar_uma_proposta(page, i, codigo, resultados, metricas=None, deve_abortar=None):
+    """Processa a proposta identificada por `codigo`. Devolve "ok", "erro",
+    "fora_da_fila" ou "status_divergente" - usado pelo chamador para decidir
+    se houve progresso (nao trava o circuito de protecao contra travamento)
+    e se deve contar como falha consecutiva.
+
+    "fora_da_fila" e "status_divergente" nunca sao reprocessados: a proposta
+    saiu da fila de aprovacao ou nunca esteve no status esperado, entao
+    tentar de novo nao muda o resultado."""
     erro = None
     dados = None
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            dados = _abrir_e_ler_proposta(page, i)
+            dados = _abrir_e_ler_proposta(page, codigo)
             erro = None
             break
+        except ContratoForaDaFila:
+            logger.info(
+                f"[{i}] Contrato {codigo} não está mais na fila de aprovação do "
+                "Supervisor (já saiu) — seguindo para a próxima, sem novas tentativas."
+            )
+            return "fora_da_fila"
+        except ContratoStatusDivergente as e:
+            logger.info(
+                f"[{i}] Contrato {codigo} ignorado: status atual é "
+                f"'{e.status_encontrado}', diferente de '{STATUS_ELEGIVEL}' — "
+                "não será aberto nem aprovado."
+            )
+            return "status_divergente"
         except Exception as e:
             erro = e
             tipo_erro = _classificar_erro(e)
@@ -369,7 +499,7 @@ def _processar_uma_proposta(page, i, resultados, metricas=None, deve_abortar=Non
                 "aprovado": False,
             }
         )
-        return
+        return "erro"
 
     contrato, nome, valor, liquido, data_proposta, data_aprovacao_promotora, loja = dados
     logger.info(f"[{i}] Contrato {contrato} | Cliente: {nome} | Loja: {loja} | Valor Líquido: R$ {liquido:,.2f}")
@@ -405,6 +535,7 @@ def _processar_uma_proposta(page, i, resultados, metricas=None, deve_abortar=Non
             "aprovado": aprovado,
         }
     )
+    return "ok"
 
 
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
@@ -494,10 +625,25 @@ def _escrever_linha(ws, row_idx, item):
         celula.font = APROVADO_FONT if aprovado else FONTE_PADRAO
 
 
-def gerar_relatorio(resultados, caminho, sempre_anexar=False):
-    """Se sempre_anexar for True, cada proposta vira sempre uma linha nova
-    no final da aba (nunca atualiza uma linha existente pelo contrato) -
-    usado no relatorio real, para manter o historico de todas as execucoes."""
+def _localizar_contrato(wb, contrato):
+    """Procura o contrato em TODAS as abas da planilha. Devolve (ws, linha)
+    ou (None, None) se ainda nao estiver registrado."""
+    for ws in wb.worksheets:
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(row=r, column=1).value == contrato:
+                return ws, r
+    return None, None
+
+
+def gerar_relatorio(resultados, caminho):
+    """Grava as propostas na planilha SEM duplicar contratos: antes de
+    anotar, verifica se o contrato ja esta registrado em qualquer aba. Se
+    ja estiver, a linha existente e mantida (historico preservado) - a unica
+    excecao e uma aprovacao nova de um contrato que estava registrado como
+    nao aprovado (ex.: erro de aprovacao numa execucao anterior), que
+    atualiza a linha existente em vez de criar outra. Itens sem contrato
+    ('?' de erro de leitura ou '-') nao tem como ser comparados e sao
+    sempre anotados."""
 
     if os.path.exists(caminho):
         wb = load_workbook(caminho)
@@ -505,17 +651,22 @@ def gerar_relatorio(resultados, caminho, sempre_anexar=False):
         wb = Workbook()
 
     for item in resultados:
-        nome_aba = str(_ano_da_proposta(item))
-        ws = _obter_ou_criar_aba(wb, nome_aba)
-
         contrato = item.get("contrato") or "-"
+        ws = None
         row_idx = None
-        if not sempre_anexar and contrato != "-":
-            for r in range(2, ws.max_row + 1):
-                if ws.cell(row=r, column=1).value == contrato:
-                    row_idx = r
-                    break
-        if row_idx is None:
+
+        if contrato not in ("-", "?"):
+            ws_existente, linha_existente = _localizar_contrato(wb, contrato)
+            if ws_existente is not None:
+                ja_aprovado = ws_existente.cell(row=linha_existente, column=7).value == "Aprovado"
+                if item.get("aprovado", False) and not ja_aprovado:
+                    ws, row_idx = ws_existente, linha_existente
+                else:
+                    logger.info(f"Contrato {contrato} já consta na planilha; não será duplicado.")
+                    continue
+
+        if ws is None:
+            ws = _obter_ou_criar_aba(wb, str(_ano_da_proposta(item)))
             row_idx = ws.max_row + 1
 
         _escrever_linha(ws, row_idx, item)
@@ -524,7 +675,7 @@ def gerar_relatorio(resultados, caminho, sempre_anexar=False):
     wb.save(caminho)
 
 
-def _executar_rpa(metricas: Metricas, caminho_relatorio: str, sempre_anexar: bool) -> list:
+def _executar_rpa(metricas: Metricas, caminho_relatorio: str) -> list:
     """Executa o fluxo principal do RPA (login + processamento das
     propostas). Isolado em funcao propria para que o bloco __main__ possa
     envolve-lo num try/except/finally unico que sempre gera o relatorio e
@@ -535,7 +686,6 @@ def _executar_rpa(metricas: Metricas, caminho_relatorio: str, sempre_anexar: boo
             return processar_propostas(
                 page,
                 caminho_relatorio=caminho_relatorio,
-                sempre_anexar=sempre_anexar,
                 metricas=metricas,
             )
         finally:
@@ -545,7 +695,6 @@ def _executar_rpa(metricas: Metricas, caminho_relatorio: str, sempre_anexar: boo
 if __name__ == "__main__":
     os.makedirs(os.path.join(PASTA_PROJETO, "screenshots"), exist_ok=True)
     caminho_relatorio = CAMINHO_RELATORIO
-    sempre_anexar = True
 
     _, caminho_log, timestamp_execucao = setup_logging(PASTA_PROJETO)
 
@@ -567,7 +716,7 @@ if __name__ == "__main__":
     resultados: list = []
 
     try:
-        resultados = _executar_rpa(metricas, caminho_relatorio, sempre_anexar)
+        resultados = _executar_rpa(metricas, caminho_relatorio)
         logger.info(f"Relatório salvo em {caminho_relatorio} ({len(resultados)} propostas).")
     except Exception as e:
         metricas.erro_critico = str(e)
@@ -578,7 +727,16 @@ if __name__ == "__main__":
         registrar_metricas(logger, stats)
         salvar_estatisticas(stats, PASTA_PROJETO, timestamp_execucao)
 
-        anexos = coletar_anexos(caminho_log, caminho_relatorio, PASTA_PROJETO)
+        # O e-mail leva so a planilha DESTE ciclo; o historico acumulado
+        # continua em resultado_aprovacoes.xlsx (sem ir por e-mail).
+        caminho_planilha_ciclo = os.path.join(PASTA_PROJETO, "logs", f"resultado_ciclo_{timestamp_execucao}.xlsx")
+        try:
+            if resultados:
+                gerar_relatorio(resultados, caminho_planilha_ciclo)
+        except Exception as e:
+            logger.error(f"Falha ao gerar a planilha do ciclo para o e-mail: {e}", exc_info=True)
+
+        anexos = coletar_anexos(caminho_log, caminho_planilha_ciclo, PASTA_PROJETO, desde=metricas.inicio)
         corpo_html = gerar_relatorio_html(stats, resultados)
         _, status_texto_geral, _ = status_execucao(stats)
         assunto = (
