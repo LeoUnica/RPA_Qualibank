@@ -319,16 +319,18 @@ def gerar_relatorio_html(
             f'<td>{item.get("loja") or "-"}</td>'
             f'<td align="right">{_fmt_moeda(item.get("liquido"))}</td>'
             f'<td>{item.get("data_proposta") or "-"}</td>'
+            f'<td>{item.get("data_aprovacao_promotora") or "-"}</td>'
+            f'<td>{item.get("data_aprovacao_supervisor") or "-"}</td>'
             f'<td align="center">{emoji_status} {status_texto}</td>'
             "</tr>"
         )
 
-    nota_truncamento = "<p>Datas completas de aprovação (promotora e supervisor) disponíveis na planilha em anexo.</p>"
+    nota_truncamento = ""
     if len(resultados) > MAX_LINHAS_TABELA_EMAIL:
         restante = len(resultados) - MAX_LINHAS_TABELA_EMAIL
         nota_truncamento = (
             f"<p>Exibindo as primeiras {MAX_LINHAS_TABELA_EMAIL} propostas nesta tabela "
-            f"({restante} adicionais e as datas completas de aprovação no relatório Excel em anexo).</p>"
+            f"({restante} adicionais no relatório Excel em anexo).</p>"
         )
 
     aviso_nota_topo = f"<p>{nota_topo}</p>" if nota_topo else ""
@@ -403,9 +405,11 @@ def gerar_relatorio_html(
 <th align="left">Loja</th>
 <th align="right">Valor Líquido</th>
 <th align="left">Data da Proposta</th>
+<th align="left">Data Aprovação Promotora</th>
+<th align="left">Data Aprovação Supervisor</th>
 <th align="center">Status</th>
 </tr>
-{''.join(linhas_html) if linhas_html else '<tr><td colspan="6" align="center">Nenhuma proposta processada.</td></tr>'}
+{''.join(linhas_html) if linhas_html else '<tr><td colspan="8" align="center">Nenhuma proposta processada.</td></tr>'}
 </table>
 {nota_truncamento}
 
