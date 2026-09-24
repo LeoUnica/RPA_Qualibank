@@ -404,9 +404,9 @@ def gerar_relatorio_html(
 <th align="left">Cliente</th>
 <th align="left">Loja</th>
 <th align="right">Valor Líquido</th>
-<th align="left">Data da Proposta</th>
-<th align="left">Data Aprovação Promotora</th>
-<th align="left">Data Aprovação Supervisor</th>
+<th align="left">Digitação Proposta</th>
+<th align="left">Aguardando Aprovação</th>
+<th align="left">Aprovação Promotora</th>
 <th align="center">Status</th>
 </tr>
 {''.join(linhas_html) if linhas_html else '<tr><td colspan="8" align="center">Nenhuma proposta processada.</td></tr>'}

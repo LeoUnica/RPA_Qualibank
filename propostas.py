@@ -379,8 +379,19 @@ def processar_propostas(page, caminho_relatorio=None, metricas=None):
     def salvar_novos():
         nonlocal ultimo_salvo
         if caminho_relatorio and len(resultados) > ultimo_salvo:
-            gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio)
-            ultimo_salvo = len(resultados)
+            try:
+                gerar_relatorio(resultados[ultimo_salvo:], caminho_relatorio)
+                ultimo_salvo = len(resultados)
+            except Exception as e:
+                # Uma falha ao salvar (planilha bloqueada, disco cheio etc.)
+                # nunca pode derrubar a execucao nem descartar os resultados
+                # ja processados: eles continuam em memoria em `resultados`
+                # e serao reenviados no proximo checkpoint (ou no envio final
+                # por e-mail, que sempre acontece a partir da lista completa).
+                logger.error(
+                    f"Falha ao salvar checkpoint em '{caminho_relatorio}': {e}",
+                    exc_info=True,
+                )
 
     logger.info(f"Entrando na tela de propostas: {LOANS_URL}")
     page.goto(LOANS_URL)
@@ -551,9 +562,9 @@ COLUNAS_RELATORIO = [
     ("Código do Contrato", 22),
     ("Nome da Pessoa", 34),
     ("Valor Líquido", 18),
-    ("Data e Horário da Proposta", 24),
-    ("Data e Horário Aguardando Aprovação Promotora", 32),
-    ("Data e Horário da Aprovação do Supervisor", 30),
+    ("Digitação Proposta", 24),
+    ("Aguardando Aprovação", 32),
+    ("Aprovação Promotora", 30),
     ("Decisão", 22),
     ("Loja", 26),
 ]
@@ -635,6 +646,57 @@ def _localizar_contrato(wb, contrato):
     return None, None
 
 
+def _ultima_linha_com_dados(ws):
+    """Devolve o numero da ultima linha que realmente tem algum dado.
+
+    `ws.max_row` do openpyxl pode vir maior do que a ultima linha
+    preenchida (por exemplo apos edicoes manuais na planilha ou celulas
+    que so receberam formatacao). Usar esse valor direto para calcular
+    onde inserir a proxima linha deixaria linhas em branco no meio da
+    planilha, com o registro seguinte sendo escrito varias linhas abaixo
+    do ultimo dado real. Por isso percorremos de baixo para cima ate achar
+    a primeira linha com algum valor preenchido."""
+    total_colunas = len(COLUNAS_RELATORIO)
+    for r in range(ws.max_row, 1, -1):
+        if any(
+            ws.cell(row=r, column=c).value not in (None, "")
+            for c in range(1, total_colunas + 1)
+        ):
+            return r
+    return 1
+
+
+TENTATIVAS_SALVAR_PLANILHA = 5
+ESPERA_ENTRE_TENTATIVAS_SALVAR_SEGUNDOS = 3
+
+
+def _salvar_com_retentativa(wb, caminho):
+    """Salva o workbook tentando novamente em caso de arquivo bloqueado.
+
+    O arquivo pode estar momentaneamente indisponivel por estar aberto no
+    Excel ou por estar sendo sincronizado pelo OneDrive - nos dois casos o
+    bloqueio costuma ser breve. Sem essa retentativa, uma unica tentativa
+    de salvamento no pior momento faz o RPA perder o registro de todas as
+    propostas processadas na execucao (aprovadas ou nao)."""
+    ultimo_erro = None
+    for tentativa in range(1, TENTATIVAS_SALVAR_PLANILHA + 1):
+        try:
+            wb.save(caminho)
+            return
+        except PermissionError as e:
+            ultimo_erro = e
+            logger.warning(
+                f"Não foi possível salvar '{caminho}' (tentativa {tentativa}/"
+                f"{TENTATIVAS_SALVAR_PLANILHA}) - o arquivo parece estar aberto em outro "
+                f"programa (Excel/OneDrive). Tentando novamente em "
+                f"{ESPERA_ENTRE_TENTATIVAS_SALVAR_SEGUNDOS}s..."
+            )
+            if tentativa < TENTATIVAS_SALVAR_PLANILHA:
+                time.sleep(ESPERA_ENTRE_TENTATIVAS_SALVAR_SEGUNDOS)
+
+    raise ultimo_erro
+
+
 def gerar_relatorio(resultados, caminho):
     """Grava as propostas na planilha SEM duplicar contratos: antes de
     anotar, verifica se o contrato ja esta registrado em qualquer aba. Se
@@ -643,7 +705,12 @@ def gerar_relatorio(resultados, caminho):
     nao aprovado (ex.: erro de aprovacao numa execucao anterior), que
     atualiza a linha existente em vez de criar outra. Itens sem contrato
     ('?' de erro de leitura ou '-') nao tem como ser comparados e sao
-    sempre anotados."""
+    sempre anotados.
+
+    Se a planilha estiver bloqueada (aberta no Excel, sincronizando no
+    OneDrive) e as retentativas nao forem suficientes, os resultados sao
+    gravados num arquivo de contingencia ao lado do original, para que
+    nenhuma proposta processada nesta execucao seja perdida."""
 
     if os.path.exists(caminho):
         wb = load_workbook(caminho)
@@ -667,12 +734,24 @@ def gerar_relatorio(resultados, caminho):
 
         if ws is None:
             ws = _obter_ou_criar_aba(wb, str(_ano_da_proposta(item)))
-            row_idx = ws.max_row + 1
+            row_idx = _ultima_linha_com_dados(ws) + 1
 
         _escrever_linha(ws, row_idx, item)
 
     wb._sheets.sort(key=lambda ws: ws.title)
-    wb.save(caminho)
+
+    try:
+        _salvar_com_retentativa(wb, caminho)
+    except PermissionError:
+        raiz, ext = os.path.splitext(caminho)
+        caminho_contingencia = f"{raiz}_PENDENTE_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+        logger.critical(
+            f"Não foi possível salvar '{caminho}' após {TENTATIVAS_SALVAR_PLANILHA} tentativas "
+            f"(arquivo bloqueado). Para não perder os dados desta execução, eles foram gravados "
+            f"em '{caminho_contingencia}' - copie o conteúdo para a planilha principal manualmente "
+            "assim que possível e feche o arquivo original antes da próxima execução."
+        )
+        wb.save(caminho_contingencia)
 
 
 def _executar_rpa(metricas: Metricas, caminho_relatorio: str) -> list:
